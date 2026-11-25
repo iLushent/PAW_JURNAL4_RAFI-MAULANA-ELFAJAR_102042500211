@@ -1,0 +1,488 @@
+diff --git a/app/Http/Controllers/MataKuliahController.php b/app/Http/Controllers/MataKuliahController.php
+index b69cdcf..b7fb0c7 100644
+--- a/app/Http/Controllers/MataKuliahController.php
++++ b/app/Http/Controllers/MataKuliahController.php
+@@ -37,8 +37,27 @@ public function index(Request $request): View|RedirectResponse
+             });
+         }
+ 
+-        // TODO 4: Tambahkan logika filter berdasarkan parameter 'semester' dan pengurutan berdasarkan parameter 'sort' (nama_asc, nama_desc, sks_desc, sks_asc)
+-        $query->orderBy('nama_mk');
++        // Filter berdasarkan semester
++        if ($request->filled('semester')) {
++            $query->where('semester', $request->input('semester'));
++        }
++
++        // Pengurutan data
++        switch ($request->input('sort')) {
++            case 'nama_desc':
++                $query->orderBy('nama_mk', 'desc');
++                break;
++            case 'sks_desc':
++                $query->orderBy('sks', 'desc')->orderBy('nama_mk');
++                break;
++            case 'sks_asc':
++                $query->orderBy('sks', 'asc')->orderBy('nama_mk');
++                break;
++            case 'nama_asc':
++            default:
++                $query->orderBy('nama_mk', 'asc');
++                break;
++        }
+ 
+         $courses = $query->with('dosen')
+             ->withCount([
+diff --git a/app/Http/Controllers/SubmissionController.php b/app/Http/Controllers/SubmissionController.php
+index 83db5ed..6c46a4e 100644
+--- a/app/Http/Controllers/SubmissionController.php
++++ b/app/Http/Controllers/SubmissionController.php
+@@ -7,6 +7,7 @@
+ use Illuminate\Http\RedirectResponse;
+ use Illuminate\Http\Request;
+ use Illuminate\Support\Facades\Auth;
++use Illuminate\Support\Str;
+ use Symfony\Component\HttpFoundation\StreamedResponse;
+ 
+ class SubmissionController extends Controller
+@@ -56,21 +57,69 @@ public function store(Request $request, Assignment $assignment): RedirectRespons
+ 
+     public function grade(Request $request, Submission $submission): RedirectResponse
+     {
+-        // TODO 5a (grade): Cek apakah dosen adalah pengampu mata kuliah, validasi nilai (0-100) & catatan_dosen, lalu update submission.
+-        // 1. Pastikan $submission->assignment->course->dosen_id === Auth::id(), jika tidak abort(403).
+-        // 2. Validasi input 'nilai' (required|integer|min:0|max:100) dan 'catatan_dosen' (nullable|string|max:1000).
+-        // 3. Simpan perubahan menggunakan $submission->update(...) dan redirect back() dengan pesan sukses.
++        // 1. Hanya dosen pengampu mata kuliah ini yang boleh menilai
++        if ($submission->assignment->course->dosen_id !== Auth::id()) {
++            abort(403, 'Akses ditolak. Anda bukan dosen pengampu mata kuliah tugas ini.');
++        }
+ 
+-        abort(501, 'Fitur belum diimplementasikan');
++        // 2. Validasi nilai (0-100) dan catatan dosen
++        $validated = $request->validate([
++            'nilai' => ['required', 'integer', 'min:0', 'max:100'],
++            'catatan_dosen' => ['nullable', 'string', 'max:1000'],
++        ], [
++            'nilai.required' => 'Nilai wajib diisi.',
++            'nilai.integer' => 'Nilai harus berupa angka bulat.',
++            'nilai.min' => 'Nilai minimal 0.',
++            'nilai.max' => 'Nilai maksimal 100.',
++            'catatan_dosen.max' => 'Catatan dosen maksimal 1000 karakter.',
++        ]);
++
++        // 3. Simpan perubahan
++        $submission->update($validated);
++
++        return back()->with('success', "Nilai mahasiswa {$submission->user->name} berhasil disimpan.");
+     }
+ 
+     public function exportCsv(Assignment $assignment): StreamedResponse
+     {
+-        // TODO 5b (exportCsv): Cek kepemilikan dosen, lalu gunakan response()->streamDownload() dan fputcsv() untuk mengunduh data nilai mahasiswa.
+-        // 1. Pastikan $assignment->course->dosen_id === Auth::id(), jika tidak abort(403).
+-        // 2. Muat relasi course.approvedStudents dan submissions dari $assignment.
+-        // 3. Kembalikan response()->streamDownload(...) yang menulis header & baris CSV menggunakan fopen('php://output', 'w') dan fputcsv().
++        // 1. Hanya dosen pengampu yang boleh mengunduh rekap
++        if ($assignment->course->dosen_id !== Auth::id()) {
++            abort(403, 'Akses ditolak. Anda bukan dosen pengampu mata kuliah tugas ini.');
++        }
++
++        // 2. Muat mahasiswa resmi dan data pengumpulan
++        $assignment->load(['course.approvedStudents', 'submissions']);
++        $students = $assignment->course->approvedStudents;
++        $submissions = $assignment->submissions->keyBy('user_id');
++
++        $filename = 'rekap-nilai-' . Str::slug($assignment->course->kode_mk . '-' . $assignment->judul) . '.csv';
++
++        // 3. Tulis CSV langsung ke output (streaming)
++        return response()->streamDownload(function () use ($students, $submissions) {
++            $out = fopen('php://output', 'w');
++
++            // BOM UTF-8 agar Excel membaca karakter dengan benar
++            fwrite($out, "\xEF\xBB\xBF");
++
++            fputcsv($out, ['No', 'Nama', 'NIM', 'Email', 'Status Pengumpulan', 'Waktu Pengumpulan', 'Nilai', 'Status Nilai', 'Catatan Dosen']);
++
++            foreach ($students as $i => $student) {
++                $sub = $submissions->get($student->id);
++
++                fputcsv($out, [
++                    $i + 1,
++                    $student->name,
++                    $student->nomor_induk ?? '-',
++                    $student->email,
++                    $sub ? 'Sudah Mengumpulkan' : 'Belum Mengumpulkan',
++                    $sub && $sub->submitted_at ? $sub->submitted_at->format('Y-m-d H:i') : '-',
++                    $sub && $sub->nilai !== null ? $sub->nilai : '-',
++                    $sub ? $sub->status_nilai : '-',
++                    $sub && $sub->catatan_dosen ? $sub->catatan_dosen : '-',
++                ]);
++            }
+ 
+-        abort(501, 'Fitur belum diimplementasikan');
++            fclose($out);
++        }, $filename, ['Content-Type' => 'text/csv; charset=UTF-8']);
+     }
+ }
+diff --git a/app/Models/Submission.php b/app/Models/Submission.php
+index 33e1e3f..178a045 100644
+--- a/app/Models/Submission.php
++++ b/app/Models/Submission.php
+@@ -10,11 +10,12 @@ class Submission extends Model
+ {
+     use HasFactory;
+ 
+-    // TODO 2: Tambahkan 'nilai' dan 'catatan_dosen' ke $fillable, serta lengkapi logika status nilai ('Belum Dinilai', 'Lulus' >= 70, 'Perlu Perbaikan')
+     protected $fillable = [
+         'assignment_id',
+         'user_id',
+         'jawaban',
++        'nilai',
++        'catatan_dosen',
+         'submitted_at',
+     ];
+ 
+@@ -35,7 +36,10 @@ public function user(): BelongsTo
+ 
+     public function getStatusNilaiAttribute(): string
+     {
+-        // TODO 2: Lengkapi logika status nilai ('Belum Dinilai' jika null, 'Lulus' jika >= 70, selain itu 'Perlu Perbaikan')
+-        return '';
++        if ($this->nilai === null) {
++            return 'Belum Dinilai';
++        }
++
++        return $this->nilai >= 70 ? 'Lulus' : 'Perlu Perbaikan';
+     }
+ }
+diff --git a/database/migrations/2026_10_25_000001_add_grading_to_submissions_table.php b/database/migrations/2026_10_25_000001_add_grading_to_submissions_table.php
+index 4d4d01f..41e317d 100644
+--- a/database/migrations/2026_10_25_000001_add_grading_to_submissions_table.php
++++ b/database/migrations/2026_10_25_000001_add_grading_to_submissions_table.php
+@@ -10,7 +10,8 @@ public function up(): void
+     {
+         if (Schema::hasTable('submissions')) {
+             Schema::table('submissions', function (Blueprint $table) {
+-                // TODO 1: Tambahkan kolom 'nilai' (unsignedTinyInteger, nullable) dan 'catatan_dosen' (text, nullable) setelah kolom 'jawaban'
++                $table->unsignedTinyInteger('nilai')->nullable()->after('jawaban');
++                $table->text('catatan_dosen')->nullable()->after('nilai');
+             });
+         }
+     }
+@@ -19,7 +20,7 @@ public function down(): void
+     {
+         if (Schema::hasTable('submissions')) {
+             Schema::table('submissions', function (Blueprint $table) {
+-                // TODO 1 (Rollback): Hapus kolom 'nilai' dan 'catatan_dosen' menggunakan $table->dropColumn(...)
++                $table->dropColumn(['nilai', 'catatan_dosen']);
+             });
+         }
+     }
+diff --git a/database/seeders/DatabaseSeeder.php b/database/seeders/DatabaseSeeder.php
+index 69ff40b..01e2b14 100644
+--- a/database/seeders/DatabaseSeeder.php
++++ b/database/seeders/DatabaseSeeder.php
+@@ -62,6 +62,95 @@ public function run(): void
+             ]
+         );
+ 
+-        // TODO 8: Tambahkan minimal 2 mata kuliah lagi dengan semester berbeda, 1 mahasiswa tambahan, 2 tugas, dan contoh data submission
++        // ===== Data tambahan Modul 4 =====
++
++        // 6. Mahasiswa tambahan
++        $mahasiswa2 = User::updateOrCreate(
++            ['email' => 'siti@celoe.test'],
++            [
++                'name' => 'Siti Nurhaliza',
++                'password' => Hash::make('mahasiswa123'),
++                'role' => 'mahasiswa',
++                'nomor_induk' => '1301210002',
++            ]
++        );
++
++        // 7. Dua mata kuliah tambahan dengan semester berbeda
++        $course2 = MataKuliah::updateOrCreate(
++            ['kode_mk' => 'IF204'],
++            [
++                'nama_mk' => 'Basis Data Relasional',
++                'deskripsi' => 'Mata kuliah perancangan basis data relasional, normalisasi, ERD, dan optimasi query SQL.',
++                'sks' => 3,
++                'semester' => 'Ganjil 2026/2027',
++                'dosen_id' => $dosen->id,
++            ]
++        );
++
++        $course3 = MataKuliah::updateOrCreate(
++            ['kode_mk' => 'IF402'],
++            [
++                'nama_mk' => 'Arsitektur Layanan Awan',
++                'deskripsi' => 'Mata kuliah arsitektur cloud, layanan berbasis container, dan skalabilitas aplikasi.',
++                'sks' => 2,
++                'semester' => 'Genap 2026/2027',
++                'dosen_id' => $dosen->id,
++            ]
++        );
++
++        // 8. Pendaftaran mahasiswa (approved)
++        $course1->students()->syncWithoutDetaching([
++            $mahasiswa2->id => ['status' => 'approved'],
++        ]);
++        $course2->students()->syncWithoutDetaching([
++            $mahasiswa1->id => ['status' => 'approved'],
++        ]);
++
++        // 9. Dua tugas
++        $tugas1 = Assignment::updateOrCreate(
++            ['course_id' => $course1->id, 'judul' => 'Tugas 1: Implementasi Middleware & Eloquent ORM'],
++            [
++                'deskripsi' => 'Jelaskan cara kerja Route Middleware untuk proteksi peran pengguna serta implementasi relasi Eloquent pada studi kasus CeLOE LMS.',
++                'deadline' => now()->addDays(5),
++            ]
++        );
++
++        $tugas2 = Assignment::updateOrCreate(
++            ['course_id' => $course2->id, 'judul' => 'Tugas 1: Normalisasi Basis Data'],
++            [
++                'deskripsi' => 'Lakukan normalisasi tabel transaksi penjualan hingga bentuk normal ketiga (3NF) dan jelaskan setiap tahapannya.',
++                'deadline' => now()->addDays(7),
++            ]
++        );
++
++        // 10. Contoh pengumpulan tugas (sudah dinilai)
++        Submission::updateOrCreate(
++            ['assignment_id' => $tugas1->id, 'user_id' => $mahasiswa1->id],
++            [
++                'jawaban' => 'Middleware di Laravel berfungsi menyaring HTTP request sebelum mencapai controller. Pada CeLOE LMS, RoleMiddleware memeriksa apakah role pengguna sesuai dengan parameter route.',
++                'submitted_at' => now()->subDays(2),
++                'nilai' => 80,
++                'catatan_dosen' => 'Penjelasan sangat terstruktur dan tepat sasaran. Pertahankan!',
++            ]
++        );
++
++        Submission::updateOrCreate(
++            ['assignment_id' => $tugas1->id, 'user_id' => $mahasiswa2->id],
++            [
++                'jawaban' => 'Relasi Eloquent menghubungkan model satu sama lain, misalnya hasMany antara MataKuliah dan Assignment, serta belongsTo dari Submission ke User.',
++                'submitted_at' => now()->subDay(),
++                'nilai' => 90,
++                'catatan_dosen' => 'Contoh relasi yang diberikan sangat relevan.',
++            ]
++        );
++
++        // Contoh pengumpulan yang belum dinilai
++        Submission::updateOrCreate(
++            ['assignment_id' => $tugas2->id, 'user_id' => $mahasiswa1->id],
++            [
++                'jawaban' => 'Tabel transaksi dipecah menjadi tabel pelanggan, produk, dan detail transaksi untuk menghilangkan redundansi dan ketergantungan transitif.',
++                'submitted_at' => now()->subHours(6),
++            ]
++        );
+     }
+ }
+diff --git a/resources/views/assignments/submissions.blade.php b/resources/views/assignments/submissions.blade.php
+index 811b905..c440d42 100644
+--- a/resources/views/assignments/submissions.blade.php
++++ b/resources/views/assignments/submissions.blade.php
+@@ -35,7 +35,9 @@
+ 
+         <div style="display: flex; gap: 0.75rem; flex-wrap: wrap;">
+             
+-            {{-- TODO 7b: Tambahkan tombol Export CSV yang mengarah ke route('assignments.export-csv', $assignment) --}}
++            <a href="{{ route('assignments.export-csv', $assignment) }}" class="btn btn-primary btn-sm">
++                Export CSV
++            </a>
+ 
+             <a href="{{ route('assignments.edit', $assignment->id) }}" class="btn btn-secondary btn-sm">
+                 Edit Tugas
+@@ -50,7 +52,26 @@
+ </div>
+ 
+ <!-- Statistik Pengumpulan & Nilai -->
+-{{-- TODO 7a: Tampilkan kartu ringkasan Total Mahasiswa, Jumlah Mengumpulkan, dan Rata-rata Nilai --}}
++<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1.5rem;">
++    <div class="card" style="margin-bottom: 0;">
++        <div class="card-body" style="padding: 1rem 1.25rem;">
++            <div style="font-size: 0.8rem; color: var(--text-muted); font-weight: 600;">Total Mahasiswa</div>
++            <div style="font-size: 1.75rem; font-weight: 700;">{{ $students->count() }}</div>
++        </div>
++    </div>
++    <div class="card" style="margin-bottom: 0;">
++        <div class="card-body" style="padding: 1rem 1.25rem;">
++            <div style="font-size: 0.8rem; color: var(--text-muted); font-weight: 600;">Sudah Mengumpulkan</div>
++            <div style="font-size: 1.75rem; font-weight: 700; color: #059669;">{{ $students->filter(fn($s) => $submissions->has($s->id))->count() }}</div>
++        </div>
++    </div>
++    <div class="card" style="margin-bottom: 0;">
++        <div class="card-body" style="padding: 1rem 1.25rem;">
++            <div style="font-size: 0.8rem; color: var(--text-muted); font-weight: 600;">Rata-rata Nilai</div>
++            <div style="font-size: 1.75rem; font-weight: 700; color: #2563eb;">{{ $averageScore ?? '-' }}</div>
++        </div>
++    </div>
++</div>
+ 
+ <!-- Daftar Pengumpulan Mahasiswa -->
+ <div class="card">
+@@ -129,8 +150,13 @@
+                                 </td>
+                                 <td>
+                                     @if($sub)
+-                                        {{-- TODO 7c: Tambahkan form PATCH untuk input nilai (0-100) dan catatan_dosen pada setiap mahasiswa yang sudah mengumpulkan --}}
+-                                        <span style="font-size: 0.8rem; color: var(--text-muted);">Form penilaian belum diimplementasikan</span>
++                                        <form action="{{ route('submissions.grade', $sub->id) }}" method="POST" style="display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center;">
++                                            @csrf
++                                            @method('PATCH')
++                                            <input type="number" name="nilai" min="0" max="100" class="form-control" style="width: 90px;" placeholder="0-100" value="{{ $sub->nilai }}" required>
++                                            <input type="text" name="catatan_dosen" class="form-control" style="flex: 1; min-width: 140px;" placeholder="Catatan dosen" maxlength="1000" value="{{ $sub->catatan_dosen }}">
++                                            <button type="submit" class="btn btn-primary btn-sm">Simpan Nilai</button>
++                                        </form>
+                                     @else
+                                         <span style="font-size: 0.8rem; color: var(--text-muted);">&mdash;</span>
+                                     @endif
+diff --git a/resources/views/courses/index.blade.php b/resources/views/courses/index.blade.php
+index 474ea3f..3447c77 100644
+--- a/resources/views/courses/index.blade.php
++++ b/resources/views/courses/index.blade.php
+@@ -37,12 +37,28 @@ class="form-control"
+                 >
+             </div>
+             
+-            {{-- TODO 6: Tambahkan dropdown filter Semester dan dropdown Urutkan (Sort) di sini --}}
++            <div>
++                <select name="semester" class="form-control" style="min-width: 180px;">
++                    <option value="">Semua Semester</option>
++                    @foreach($semesters as $sem)
++                        <option value="{{ $sem }}" {{ request('semester') === $sem ? 'selected' : '' }}>{{ $sem }}</option>
++                    @endforeach
++                </select>
++            </div>
++
++            <div>
++                <select name="sort" class="form-control" style="min-width: 170px;">
++                    <option value="nama_asc" {{ request('sort', 'nama_asc') === 'nama_asc' ? 'selected' : '' }}>Urutkan: Nama (A - Z)</option>
++                    <option value="nama_desc" {{ request('sort') === 'nama_desc' ? 'selected' : '' }}>Urutkan: Nama (Z - A)</option>
++                    <option value="sks_desc" {{ request('sort') === 'sks_desc' ? 'selected' : '' }}>Urutkan: SKS Terbanyak</option>
++                    <option value="sks_asc" {{ request('sort') === 'sks_asc' ? 'selected' : '' }}>Urutkan: SKS Tersedikit</option>
++                </select>
++            </div>
+             
+             <button type="submit" class="btn btn-secondary">
+                 Filter &amp; Cari
+             </button>
+-            @if(request('search'))
++            @if(request('search') || request('semester') || request('sort'))
+                 <a href="{{ route('courses.index') }}" class="btn btn-secondary" style="color: var(--slate-500);">
+                     Reset
+                 </a>
+diff --git a/routes/web.php b/routes/web.php
+index b09dc78..8ff593d 100644
+--- a/routes/web.php
++++ b/routes/web.php
+@@ -25,53 +25,68 @@
+         ->name('register.post');
+ });
+ 
+-// TODO 3: Bungkus route terproteksi dengan middleware 'auth', pisahkan route khusus 'role:dosen' dan 'role:mahasiswa', serta aktifkan route penilaian & export CSV
++// ============================================================
++// Rute terproteksi: wajib login (middleware 'auth')
++// ============================================================
++Route::middleware('auth')->group(function () {
+ 
+-// Logout
+-Route::post('/logout', [AuthController::class, 'logout'])->name('logout');
++    // Logout
++    Route::post('/logout', [AuthController::class, 'logout'])->name('logout');
+ 
+-// Dashboard
+-Route::get('/dashboard', [DashboardController::class, 'index'])->name('dashboard');
++    // Dashboard
++    Route::get('/dashboard', [DashboardController::class, 'index'])->name('dashboard');
+ 
+-// Profil Pengguna (Edit & Update)
+-Route::get('/profile', [ProfileController::class, 'edit'])->name('profile.edit');
+-Route::put('/profile', [ProfileController::class, 'update'])->name('profile.update');
++    // Profil Pengguna (Edit & Update)
++    Route::get('/profile', [ProfileController::class, 'edit'])->name('profile.edit');
++    Route::put('/profile', [ProfileController::class, 'update'])->name('profile.update');
+ 
+-// Mata Kuliah (Katalog & Detail Kelas untuk Dosen & Mahasiswa)
+-Route::get('/courses', [MataKuliahController::class, 'index'])->name('courses.index');
+-Route::get('/courses/{course}', [MataKuliahController::class, 'show'])->whereNumber('course')->name('courses.show');
++    // Mata Kuliah (Katalog & Detail Kelas untuk Dosen & Mahasiswa)
++    Route::get('/courses', [MataKuliahController::class, 'index'])->name('courses.index');
++    Route::get('/courses/{course}', [MataKuliahController::class, 'show'])->whereNumber('course')->name('courses.show');
+ 
+-// Manajemen Mata Kuliah (Khusus Dosen)
+-Route::get('/courses/create', [MataKuliahController::class, 'create'])->name('courses.create');
+-Route::post('/courses', [MataKuliahController::class, 'store'])->name('courses.store');
+-Route::get('/courses/{course}/edit', [MataKuliahController::class, 'edit'])->whereNumber('course')->name('courses.edit');
+-Route::put('/courses/{course}', [MataKuliahController::class, 'update'])->whereNumber('course')->name('courses.update');
+-Route::delete('/courses/{course}', [MataKuliahController::class, 'destroy'])->whereNumber('course')->name('courses.destroy');
++    // --------------------------------------------------------
++    // Khusus DOSEN (middleware 'role:dosen')
++    // --------------------------------------------------------
++    Route::middleware('role:dosen')->group(function () {
+ 
+-// Persetujuan & Manajemen Mahasiswa di Kelas (Khusus Dosen)
+-Route::patch('/courses/{course}/enrollments/{user}/approve', [MataKuliahController::class, 'approveStudent'])->whereNumber('course')->whereNumber('user')->name('courses.enrollments.approve');
+-Route::patch('/courses/{course}/enrollments/{user}/reject', [MataKuliahController::class, 'rejectStudent'])->whereNumber('course')->whereNumber('user')->name('courses.enrollments.reject');
+-Route::delete('/courses/{course}/unenroll/{user}', [MataKuliahController::class, 'unenrollStudent'])->whereNumber('course')->whereNumber('user')->name('courses.unenroll');
++        // Manajemen Mata Kuliah
++        Route::get('/courses/create', [MataKuliahController::class, 'create'])->name('courses.create');
++        Route::post('/courses', [MataKuliahController::class, 'store'])->name('courses.store');
++        Route::get('/courses/{course}/edit', [MataKuliahController::class, 'edit'])->whereNumber('course')->name('courses.edit');
++        Route::put('/courses/{course}', [MataKuliahController::class, 'update'])->whereNumber('course')->name('courses.update');
++        Route::delete('/courses/{course}', [MataKuliahController::class, 'destroy'])->whereNumber('course')->name('courses.destroy');
+ 
+-// Materi Perkuliahan / Materials (Khusus Dosen)
+-Route::get('/courses/{course}/materials/create', [MaterialController::class, 'create'])->whereNumber('course')->name('materials.create');
+-Route::post('/courses/{course}/materials', [MaterialController::class, 'store'])->whereNumber('course')->name('materials.store');
+-Route::get('/materials/{material}/edit', [MaterialController::class, 'edit'])->whereNumber('material')->name('materials.edit');
+-Route::put('/materials/{material}', [MaterialController::class, 'update'])->whereNumber('material')->name('materials.update');
+-Route::delete('/materials/{material}', [MaterialController::class, 'destroy'])->whereNumber('material')->name('materials.destroy');
++        // Persetujuan & Manajemen Mahasiswa di Kelas
++        Route::patch('/courses/{course}/enrollments/{user}/approve', [MataKuliahController::class, 'approveStudent'])->whereNumber('course')->whereNumber('user')->name('courses.enrollments.approve');
++        Route::patch('/courses/{course}/enrollments/{user}/reject', [MataKuliahController::class, 'rejectStudent'])->whereNumber('course')->whereNumber('user')->name('courses.enrollments.reject');
++        Route::delete('/courses/{course}/unenroll/{user}', [MataKuliahController::class, 'unenrollStudent'])->whereNumber('course')->whereNumber('user')->name('courses.unenroll');
+ 
+-// Tugas & Evaluasi / Assignments (Khusus Dosen)
+-Route::get('/courses/{course}/assignments/create', [AssignmentController::class, 'create'])->whereNumber('course')->name('assignments.create');
+-Route::post('/courses/{course}/assignments', [AssignmentController::class, 'store'])->whereNumber('course')->name('assignments.store');
+-Route::get('/assignments/{assignment}/edit', [AssignmentController::class, 'edit'])->whereNumber('assignment')->name('assignments.edit');
+-Route::put('/assignments/{assignment}', [AssignmentController::class, 'update'])->whereNumber('assignment')->name('assignments.update');
+-Route::delete('/assignments/{assignment}', [AssignmentController::class, 'destroy'])->whereNumber('assignment')->name('assignments.destroy');
+-Route::get('/assignments/{assignment}/submissions', [AssignmentController::class, 'submissions'])->whereNumber('assignment')->name('assignments.submissions');
++        // Materi Perkuliahan
++        Route::get('/courses/{course}/materials/create', [MaterialController::class, 'create'])->whereNumber('course')->name('materials.create');
++        Route::post('/courses/{course}/materials', [MaterialController::class, 'store'])->whereNumber('course')->name('materials.store');
++        Route::get('/materials/{material}/edit', [MaterialController::class, 'edit'])->whereNumber('material')->name('materials.edit');
++        Route::put('/materials/{material}', [MaterialController::class, 'update'])->whereNumber('material')->name('materials.update');
++        Route::delete('/materials/{material}', [MaterialController::class, 'destroy'])->whereNumber('material')->name('materials.destroy');
+ 
+-// Penilaian Tugas & Export CSV (Khusus Dosen - Aktifkan di TODO 3)
+-// Route::patch('/submissions/{submission}/grade', [SubmissionController::class, 'grade'])->whereNumber('submission')->name('submissions.grade');
+-// Route::get('/assignments/{assignment}/export-csv', [SubmissionController::class, 'exportCsv'])->whereNumber('assignment')->name('assignments.export-csv');
++        // Tugas & Evaluasi
++        Route::get('/courses/{course}/assignments/create', [AssignmentController::class, 'create'])->whereNumber('course')->name('assignments.create');
++        Route::post('/courses/{course}/assignments', [AssignmentController::class, 'store'])->whereNumber('course')->name('assignments.store');
++        Route::get('/assignments/{assignment}/edit', [AssignmentController::class, 'edit'])->whereNumber('assignment')->name('assignments.edit');
++        Route::put('/assignments/{assignment}', [AssignmentController::class, 'update'])->whereNumber('assignment')->name('assignments.update');
++        Route::delete('/assignments/{assignment}', [AssignmentController::class, 'destroy'])->whereNumber('assignment')->name('assignments.destroy');
++        Route::get('/assignments/{assignment}/submissions', [AssignmentController::class, 'submissions'])->whereNumber('assignment')->name('assignments.submissions');
+ 
+-// Pengajuan Pendaftaran Kelas & Pengumpulan Tugas (Khusus Mahasiswa)
+-Route::post('/courses/{course}/enroll-request', [MataKuliahController::class, 'enrollRequest'])->whereNumber('course')->name('courses.enroll-request');
+-Route::post('/assignments/{assignment}/submit', [SubmissionController::class, 'store'])->whereNumber('assignment')->name('submissions.store');
++        // Penilaian Tugas & Export CSV
++        Route::patch('/submissions/{submission}/grade', [SubmissionController::class, 'grade'])->whereNumber('submission')->name('submissions.grade');
++        Route::get('/assignments/{assignment}/export-csv', [SubmissionController::class, 'exportCsv'])->whereNumber('assignment')->name('assignments.export-csv');
++    });
++
++    // --------------------------------------------------------
++    // Khusus MAHASISWA (middleware 'role:mahasiswa')
++    // --------------------------------------------------------
++    Route::middleware('role:mahasiswa')->group(function () {
++        // Pengajuan Pendaftaran Kelas & Pengumpulan Tugas
++        Route::post('/courses/{course}/enroll-request', [MataKuliahController::class, 'enrollRequest'])->whereNumber('course')->name('courses.enroll-request');
++        Route::post('/assignments/{assignment}/submit', [SubmissionController::class, 'store'])->whereNumber('assignment')->name('submissions.store');
++    });
++});
